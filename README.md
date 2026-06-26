@@ -4,6 +4,10 @@ A tiny, dependency-free C implementation of the **WiFi Audio Streaming (WFAS) v2
 wire protocol: the packet format used by the WFAS desktop and Android apps to
 stream raw 16-bit PCM audio over UDP on a local network.
 
+> **Designed to interoperate out of the box with the official WFAS apps:**
+> - 🖥️ **Desktop**: https://github.com/marcomorosi06/WiFiAudioStreaming-Desktop
+> - 📱 **Android**: https://github.com/marcomorosi06/WiFiAudioStreaming-Android
+
 This is meant as a drop-in starting point for **embedded / firmware** developers
 (ESP32, STM32, RP2040, Linux SBCs, …) who want a device to act as a WFAS server
 (audio source) or client (audio sink) and interoperate with the apps.
