@@ -1,4 +1,4 @@
-# WFAS v2 — C reference implementation
+# WFAS v2 - C reference implementation
 
 A tiny, dependency-free C implementation of the **WiFi Audio Streaming (WFAS) v2**
 wire protocol: the packet format used by the WFAS desktop and Android apps to
