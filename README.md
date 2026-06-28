@@ -1,4 +1,4 @@
-# WFAS v2 C reference implementation
+# WFAS v2 — C reference implementation
 
 A tiny, dependency-free C implementation of the **WiFi Audio Streaming (WFAS) v2**
 wire protocol: the packet format used by the WFAS desktop and Android apps to
@@ -93,6 +93,38 @@ otherwise the bytes are already little-endian.
 per-channel sample index and advances by `frames` on each audio packet (silence
 frames advance `seq` only). Every server **must** fill both on every packet.
 
+## Security & encryption (optional)
+
+Both layers use a pre-shared key and need no asymmetric crypto. They are optional:
+a peer that wants neither stays fully conformant.
+
+**Authentication** (who may connect) — mutual HMAC-SHA256 challenge-response:
+
+| Function | Purpose |
+|---|---|
+| `wfas_hmac_sha256(key,kl,msg,ml,out)` | HMAC-SHA256, self-contained (RFC 2104). |
+| `wfas_auth_proof(key,side,cnonce,snonce,out)` | Compute the `'S'`/`'C'` proof hex. |
+| `wfas_proof_equal(a,b)` | Constant-time hex compare. |
+| `wfas_get_token(msg,token,out,cap)` | Read `;token=value` from a control message. |
+
+**Encryption** (what is sent) — ChaCha20-Poly1305 (RFC 8439) per packet, keys via
+HKDF-SHA256 (RFC 5869):
+
+| Function | Purpose |
+|---|---|
+| `wfas_derive_unicast_keys(key,cnonce,snonce,&c2s,&s2c)` | Per-direction session keys from the handshake nonces. |
+| `wfas_derive_multicast_key(key,salt,len,&dir)` | Group key from the beacon salt. |
+| `wfas_encrypt_packet(&dir,out,cap,seq,pos,silence,pcm,len)` | Seal a packet; advances the counter. |
+| `wfas_decrypt_packet(&dir,&win,buf,len,&hdr,&ctr,out,cap)` | Open + anti-replay; returns len, -1 (auth), -2 (replay). |
+| `wfas_replay_init/check/commit(&win,...)` | 1024-wide anti-replay window. |
+| `wfas_build_mcast_beacon / wfas_parse_mcast_beacon(...)` | Signed multicast key beacon with monotonic `epoch`. |
+
+Encrypted packet = `[header 10B (AAD)] [counter 8B] [ciphertext] [Poly1305 tag 16B]`;
+the header flags byte sets bit1 (`0x02`, encrypted) alongside bit0 (silence), and
+`nonce = prefix(4B) || counter(8B)`. See `WFAS_PROTOCOL.md` Sections 7–8 for the
+normative details. The bundled `wfas_test selftest` checks all of the above against
+the RFC 8439 / 5869 / 4231 test vectors.
+
 ## The wire protocol (summary)
 
 Raw 16-bit PCM over UDP. Three phases: discovery (the server announces itself via
@@ -140,8 +172,13 @@ BYE / CLIENT_BYE                              clean disconnect
 Discovery beacon (UDP multicast `239.255.0.1:9091`, every ~3 s):
 
 ```
-WIFI_AUDIO_STREAMER_DISCOVERY;<host>;<MULTICAST|UNICAST>;<port>;protocols=...;sr=..;ch=..;bd=..
+WIFI_AUDIO_STREAMER_DISCOVERY;<host>;<MULTICAST|UNICAST>;<port>;protocols=...;sr=..;ch=..;bd=..[;auth=OFF|ASK|KEY][;enc=0|1]
 ```
+
+The optional `auth=` and `enc=` tokens are advisory display hints (let a client
+badge a server as encrypted / key-protected); they are unauthenticated and must
+not drive any security decision. Unknown tokens are ignored, so they are
+backward-compatible.
 
 The full normative specification lives in the app repositories
 (`WFAS_PROTOCOL.md`). This implementation is the executable companion to it.

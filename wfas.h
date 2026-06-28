@@ -81,6 +81,92 @@ int  wfas_proof_equal(const char *a, const char *b);
  * Copies up to out_cap-1 bytes (stops at ';' or end). Returns the length, 0 if absent. */
 int  wfas_get_token(const char *msg, const char *token, char *out, size_t out_cap);
 
+/* ── Encryption (protocol Section 8): ChaCha20-Poly1305 AEAD ────────────────
+ * Per-packet AEAD over UDP. The 10-byte header travels in clear and is bound as
+ * associated data; an explicit 8-byte counter (the low part of the 96-bit nonce)
+ * travels in clear so the receiver can reconstruct the nonce despite loss/reorder.
+ * Encrypted packet layout:
+ *   [header 10B] [counter 8B big-endian] [ciphertext] [Poly1305 tag 16B]
+ * nonce(12B) = nonce_prefix(4B, per-direction) || counter(8B big-endian).        */
+#define WFAS_FLAG_ENCRYPTED   0x02
+#define WFAS_KEY_BYTES        32
+#define WFAS_AEAD_TAG_BYTES   16
+#define WFAS_COUNTER_BYTES    8
+#define WFAS_NONCE_PREFIX_BYTES 4
+#define WFAS_AEAD_OVERHEAD    (WFAS_COUNTER_BYTES + WFAS_AEAD_TAG_BYTES) /* 24 */
+#define WFAS_MAX_ENC_PAYLOAD  (WFAS_MAX_PAYLOAD - WFAS_AEAD_OVERHEAD)
+#define WFAS_SALT_BYTES       16
+#define WFAS_MSG_MCAST_ENC    "WFAS_MCAST_ENC"
+
+/* ChaCha20-Poly1305 AEAD (RFC 8439). nonce is 12 bytes. tag is 16 bytes.
+ * Encrypt never fails; decrypt returns 0 if the tag is valid, -1 otherwise. */
+void wfas_chacha20_poly1305_encrypt(const uint8_t key[32], const uint8_t nonce[12],
+        const uint8_t *aad, size_t aad_len, const uint8_t *plaintext, size_t pt_len,
+        uint8_t *ciphertext, uint8_t tag[16]);
+int  wfas_chacha20_poly1305_decrypt(const uint8_t key[32], const uint8_t nonce[12],
+        const uint8_t *aad, size_t aad_len, const uint8_t *ciphertext, size_t ct_len,
+        const uint8_t tag[16], uint8_t *plaintext);
+
+/* HKDF-SHA256 (RFC 5869), extract+expand in one call. info may be NULL. */
+void wfas_hkdf_sha256(const uint8_t *salt, size_t salt_len,
+        const uint8_t *ikm, size_t ikm_len,
+        const uint8_t *info, size_t info_len, uint8_t *out, size_t out_len);
+
+/* Per-direction key material + outgoing packet counter. */
+typedef struct {
+    uint8_t  key[WFAS_KEY_BYTES];
+    uint8_t  nonce_prefix[WFAS_NONCE_PREFIX_BYTES];
+    uint64_t send_counter;
+} wfas_crypto_dir;
+
+/* Anti-replay sliding window (bitmask). Sized well above the jitter buffer depth
+ * so legitimately late packets are never mistaken for replays. */
+#define WFAS_REPLAY_BITS  1024
+#define WFAS_REPLAY_WORDS (WFAS_REPLAY_BITS / 64)
+typedef struct {
+    uint64_t max_counter;
+    uint64_t seen[WFAS_REPLAY_WORDS];
+    int      initialized;
+} wfas_replay_window;
+
+void wfas_replay_init(wfas_replay_window *w);
+/* Pre-check (no state change): 1 = acceptable, 0 = too old or already seen (drop). */
+int  wfas_replay_check(const wfas_replay_window *w, uint64_t counter);
+/* Commit only AFTER successful authentication. */
+void wfas_replay_commit(wfas_replay_window *w, uint64_t counter);
+
+/* Derive unicast session keys from the pre-shared key and the two handshake
+ * nonces (hex strings from Section 7). Separate keys per direction. */
+void wfas_derive_unicast_keys(const char *key, const char *cnonce_hex, const char *snonce_hex,
+        wfas_crypto_dir *c2s, wfas_crypto_dir *s2c);
+
+/* Derive the multicast key from the pre-shared key and the session salt. */
+void wfas_derive_multicast_key(const char *key, const uint8_t *salt, size_t salt_len,
+        wfas_crypto_dir *dir);
+
+/* Build an encrypted audio packet (header+counter+ciphertext+tag). Increments
+ * dir->send_counter. Returns total length or -1. pcm_len may be 0 (silence). */
+int  wfas_encrypt_packet(wfas_crypto_dir *dir, uint8_t *out, size_t out_cap,
+        uint16_t seq, uint32_t sample_pos, int silence,
+        const uint8_t *pcm, size_t pcm_len);
+
+/* Decrypt a received encrypted packet. Verifies the tag (header as AAD) and the
+ * anti-replay window. Returns plaintext length (>=0), -1 on auth/format failure,
+ * or -2 if dropped as replay/too-old. Fills hdr and counter when non-NULL. */
+int  wfas_decrypt_packet(const wfas_crypto_dir *dir, wfas_replay_window *win,
+        const uint8_t *buf, size_t len, wfas_header *hdr, uint64_t *counter,
+        uint8_t *out_pcm, size_t out_cap);
+
+/* Multicast beacon: "WFAS_MCAST_ENC;epoch=<n>;time=<unix>;salt=<hex>;mac=<hex>".
+ * The MAC is HMAC(key, "WFAS-MCAST:epoch=..;time=..;salt=..") so epoch/time/salt
+ * cannot be forged. Build returns length or -1. */
+int  wfas_build_mcast_beacon(const char *key, uint64_t epoch, uint64_t timestamp,
+        const uint8_t *salt, size_t salt_len, char *out, size_t out_cap);
+/* Verify the beacon MAC and that epoch > last_epoch (defeats whole-session replay).
+ * Returns 0 and fills epoch/timestamp/salt; -1 bad format/MAC; -2 stale epoch. */
+int  wfas_parse_mcast_beacon(const char *key, const char *msg, uint64_t last_epoch,
+        uint64_t *epoch, uint64_t *timestamp, uint8_t *salt, size_t salt_cap, size_t *salt_len);
+
 #ifdef __cplusplus
 }
 #endif

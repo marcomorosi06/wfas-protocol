@@ -224,3 +224,402 @@ int wfas_get_token(const char *msg, const char *token, char *out, size_t cap) {
     out[i] = 0;
     return (int)i;
 }
+
+/* ── ChaCha20 (RFC 8439 Section 2.3) ─────────────────────────────────────────*/
+static uint32_t rd_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static void wr_le32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static uint64_t rd_be64(const uint8_t *p) {
+    uint64_t v = 0; int i; for (i = 0; i < 8; i++) v = (v << 8) | p[i]; return v;
+}
+static void wr_be64(uint8_t *p, uint64_t v) {
+    int i; for (i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (56 - 8 * i));
+}
+#define ROTL32(x,n) (((x) << (n)) | ((x) >> (32 - (n))))
+static void chacha_qr(uint32_t *x, int a, int b, int c, int d) {
+    x[a] += x[b]; x[d] ^= x[a]; x[d] = ROTL32(x[d], 16);
+    x[c] += x[d]; x[b] ^= x[c]; x[b] = ROTL32(x[b], 12);
+    x[a] += x[b]; x[d] ^= x[a]; x[d] = ROTL32(x[d], 8);
+    x[c] += x[d]; x[b] ^= x[c]; x[b] = ROTL32(x[b], 7);
+}
+static void chacha20_block(const uint8_t key[32], uint32_t counter, const uint8_t nonce[12], uint8_t out[64]) {
+    static const uint32_t C[4] = { 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574 };
+    uint32_t s[16], x[16];
+    int i;
+    s[0] = C[0]; s[1] = C[1]; s[2] = C[2]; s[3] = C[3];
+    for (i = 0; i < 8; i++) s[4 + i] = rd_le32(key + i * 4);
+    s[12] = counter;
+    s[13] = rd_le32(nonce + 0); s[14] = rd_le32(nonce + 4); s[15] = rd_le32(nonce + 8);
+    for (i = 0; i < 16; i++) x[i] = s[i];
+    for (i = 0; i < 10; i++) {
+        chacha_qr(x, 0, 4, 8, 12); chacha_qr(x, 1, 5, 9, 13);
+        chacha_qr(x, 2, 6, 10, 14); chacha_qr(x, 3, 7, 11, 15);
+        chacha_qr(x, 0, 5, 10, 15); chacha_qr(x, 1, 6, 11, 12);
+        chacha_qr(x, 2, 7, 8, 13); chacha_qr(x, 3, 4, 9, 14);
+    }
+    for (i = 0; i < 16; i++) wr_le32(out + i * 4, x[i] + s[i]);
+}
+static void chacha20_xor(const uint8_t key[32], uint32_t counter, const uint8_t nonce[12],
+                         const uint8_t *in, uint8_t *out, size_t len) {
+    uint8_t blk[64];
+    size_t i = 0, j;
+    while (i < len) {
+        chacha20_block(key, counter, nonce, blk);
+        counter++;
+        size_t n = len - i; if (n > 64) n = 64;
+        for (j = 0; j < n; j++) out[i + j] = in[i + j] ^ blk[j];
+        i += n;
+    }
+}
+
+/* ── Poly1305 (RFC 8439 Section 2.5), 32-bit "donna" implementation ──────────*/
+typedef struct {
+    uint32_t r[5], h[5], pad[4];
+    size_t leftover;
+    uint8_t buffer[16];
+    uint8_t final;
+} poly1305_ctx;
+
+static void poly1305_init(poly1305_ctx *st, const uint8_t key[32]) {
+    st->r[0] = (rd_le32(key + 0)) & 0x3ffffff;
+    st->r[1] = (rd_le32(key + 3) >> 2) & 0x3ffff03;
+    st->r[2] = (rd_le32(key + 6) >> 4) & 0x3ffc0ff;
+    st->r[3] = (rd_le32(key + 9) >> 6) & 0x3f03fff;
+    st->r[4] = (rd_le32(key + 12) >> 8) & 0x00fffff;
+    st->h[0] = st->h[1] = st->h[2] = st->h[3] = st->h[4] = 0;
+    st->pad[0] = rd_le32(key + 16); st->pad[1] = rd_le32(key + 20);
+    st->pad[2] = rd_le32(key + 24); st->pad[3] = rd_le32(key + 28);
+    st->leftover = 0; st->final = 0;
+}
+static void poly1305_blocks(poly1305_ctx *st, const uint8_t *m, size_t bytes) {
+    const uint32_t hibit = st->final ? 0 : (1u << 24);
+    uint32_t r0 = st->r[0], r1 = st->r[1], r2 = st->r[2], r3 = st->r[3], r4 = st->r[4];
+    uint32_t s1 = r1 * 5, s2 = r2 * 5, s3 = r3 * 5, s4 = r4 * 5;
+    uint32_t h0 = st->h[0], h1 = st->h[1], h2 = st->h[2], h3 = st->h[3], h4 = st->h[4];
+    while (bytes >= 16) {
+        uint64_t d0, d1, d2, d3, d4; uint32_t c;
+        h0 += (rd_le32(m + 0)) & 0x3ffffff;
+        h1 += (rd_le32(m + 3) >> 2) & 0x3ffffff;
+        h2 += (rd_le32(m + 6) >> 4) & 0x3ffffff;
+        h3 += (rd_le32(m + 9) >> 6) & 0x3ffffff;
+        h4 += (rd_le32(m + 12) >> 8) | hibit;
+        d0 = (uint64_t)h0 * r0 + (uint64_t)h1 * s4 + (uint64_t)h2 * s3 + (uint64_t)h3 * s2 + (uint64_t)h4 * s1;
+        d1 = (uint64_t)h0 * r1 + (uint64_t)h1 * r0 + (uint64_t)h2 * s4 + (uint64_t)h3 * s3 + (uint64_t)h4 * s2;
+        d2 = (uint64_t)h0 * r2 + (uint64_t)h1 * r1 + (uint64_t)h2 * r0 + (uint64_t)h3 * s4 + (uint64_t)h4 * s3;
+        d3 = (uint64_t)h0 * r3 + (uint64_t)h1 * r2 + (uint64_t)h2 * r1 + (uint64_t)h3 * r0 + (uint64_t)h4 * s4;
+        d4 = (uint64_t)h0 * r4 + (uint64_t)h1 * r3 + (uint64_t)h2 * r2 + (uint64_t)h3 * r1 + (uint64_t)h4 * r0;
+        c = (uint32_t)(d0 >> 26); h0 = (uint32_t)d0 & 0x3ffffff;
+        d1 += c; c = (uint32_t)(d1 >> 26); h1 = (uint32_t)d1 & 0x3ffffff;
+        d2 += c; c = (uint32_t)(d2 >> 26); h2 = (uint32_t)d2 & 0x3ffffff;
+        d3 += c; c = (uint32_t)(d3 >> 26); h3 = (uint32_t)d3 & 0x3ffffff;
+        d4 += c; c = (uint32_t)(d4 >> 26); h4 = (uint32_t)d4 & 0x3ffffff;
+        h0 += c * 5; c = h0 >> 26; h0 &= 0x3ffffff; h1 += c;
+        m += 16; bytes -= 16;
+    }
+    st->h[0] = h0; st->h[1] = h1; st->h[2] = h2; st->h[3] = h3; st->h[4] = h4;
+}
+static void poly1305_update(poly1305_ctx *st, const uint8_t *m, size_t bytes) {
+    size_t i;
+    if (st->leftover) {
+        size_t want = 16 - st->leftover; if (want > bytes) want = bytes;
+        for (i = 0; i < want; i++) st->buffer[st->leftover + i] = m[i];
+        bytes -= want; m += want; st->leftover += want;
+        if (st->leftover < 16) return;
+        poly1305_blocks(st, st->buffer, 16);
+        st->leftover = 0;
+    }
+    if (bytes >= 16) {
+        size_t want = bytes & ~(size_t)15;
+        poly1305_blocks(st, m, want);
+        m += want; bytes -= want;
+    }
+    if (bytes) {
+        for (i = 0; i < bytes; i++) st->buffer[st->leftover + i] = m[i];
+        st->leftover += bytes;
+    }
+}
+static void poly1305_finish(poly1305_ctx *st, uint8_t mac[16]) {
+    uint32_t h0, h1, h2, h3, h4, c, g0, g1, g2, g3, g4, mask;
+    uint64_t f;
+    if (st->leftover) {
+        size_t i = st->leftover;
+        st->buffer[i++] = 1;
+        for (; i < 16; i++) st->buffer[i] = 0;
+        st->final = 1;
+        poly1305_blocks(st, st->buffer, 16);
+    }
+    h0 = st->h[0]; h1 = st->h[1]; h2 = st->h[2]; h3 = st->h[3]; h4 = st->h[4];
+    c = h1 >> 26; h1 &= 0x3ffffff; h2 += c;
+    c = h2 >> 26; h2 &= 0x3ffffff; h3 += c;
+    c = h3 >> 26; h3 &= 0x3ffffff; h4 += c;
+    c = h4 >> 26; h4 &= 0x3ffffff; h0 += c * 5;
+    c = h0 >> 26; h0 &= 0x3ffffff; h1 += c;
+    g0 = h0 + 5; c = g0 >> 26; g0 &= 0x3ffffff;
+    g1 = h1 + c; c = g1 >> 26; g1 &= 0x3ffffff;
+    g2 = h2 + c; c = g2 >> 26; g2 &= 0x3ffffff;
+    g3 = h3 + c; c = g3 >> 26; g3 &= 0x3ffffff;
+    g4 = h4 + c - (1u << 26);
+    mask = (g4 >> 31) - 1;
+    g0 &= mask; g1 &= mask; g2 &= mask; g3 &= mask; g4 &= mask;
+    mask = ~mask;
+    h0 = (h0 & mask) | g0; h1 = (h1 & mask) | g1; h2 = (h2 & mask) | g2;
+    h3 = (h3 & mask) | g3; h4 = (h4 & mask) | g4;
+    h0 = ((h0) | (h1 << 26)) & 0xffffffff;
+    h1 = ((h1 >> 6) | (h2 << 20)) & 0xffffffff;
+    h2 = ((h2 >> 12) | (h3 << 14)) & 0xffffffff;
+    h3 = ((h3 >> 18) | (h4 << 8)) & 0xffffffff;
+    f = (uint64_t)h0 + st->pad[0]; h0 = (uint32_t)f;
+    f = (uint64_t)h1 + st->pad[1] + (f >> 32); h1 = (uint32_t)f;
+    f = (uint64_t)h2 + st->pad[2] + (f >> 32); h2 = (uint32_t)f;
+    f = (uint64_t)h3 + st->pad[3] + (f >> 32); h3 = (uint32_t)f;
+    wr_le32(mac + 0, h0); wr_le32(mac + 4, h1); wr_le32(mac + 8, h2); wr_le32(mac + 12, h3);
+}
+
+/* ── ChaCha20-Poly1305 AEAD (RFC 8439 Section 2.8) ───────────────────────────*/
+static void poly1305_pad16(poly1305_ctx *st, size_t len) {
+    static const uint8_t z[16] = { 0 };
+    size_t rem = len % 16;
+    if (rem) poly1305_update(st, z, 16 - rem);
+}
+static void aead_tag(const uint8_t key[32], const uint8_t nonce[12],
+                     const uint8_t *aad, size_t aad_len,
+                     const uint8_t *ct, size_t ct_len, uint8_t tag[16]) {
+    uint8_t otk[64], lenbuf[16];
+    poly1305_ctx st;
+    chacha20_block(key, 0, nonce, otk);
+    poly1305_init(&st, otk);
+    if (aad_len) { poly1305_update(&st, aad, aad_len); poly1305_pad16(&st, aad_len); }
+    if (ct_len)  { poly1305_update(&st, ct, ct_len);   poly1305_pad16(&st, ct_len); }
+    wr_le32(lenbuf + 0, (uint32_t)aad_len); wr_le32(lenbuf + 4, (uint32_t)((uint64_t)aad_len >> 32));
+    wr_le32(lenbuf + 8, (uint32_t)ct_len);  wr_le32(lenbuf + 12, (uint32_t)((uint64_t)ct_len >> 32));
+    poly1305_update(&st, lenbuf, 16);
+    poly1305_finish(&st, tag);
+}
+void wfas_chacha20_poly1305_encrypt(const uint8_t key[32], const uint8_t nonce[12],
+        const uint8_t *aad, size_t aad_len, const uint8_t *pt, size_t pt_len,
+        uint8_t *ct, uint8_t tag[16]) {
+    if (pt_len) chacha20_xor(key, 1, nonce, pt, ct, pt_len);
+    aead_tag(key, nonce, aad, aad_len, ct, pt_len, tag);
+}
+int wfas_chacha20_poly1305_decrypt(const uint8_t key[32], const uint8_t nonce[12],
+        const uint8_t *aad, size_t aad_len, const uint8_t *ct, size_t ct_len,
+        const uint8_t tag[16], uint8_t *pt) {
+    uint8_t calc[16];
+    unsigned d = 0; size_t i;
+    aead_tag(key, nonce, aad, aad_len, ct, ct_len, calc);
+    for (i = 0; i < 16; i++) d |= (unsigned)(calc[i] ^ tag[i]);
+    if (d != 0) return -1;
+    if (ct_len) chacha20_xor(key, 1, nonce, ct, pt, ct_len);
+    return 0;
+}
+
+/* ── HKDF-SHA256 (RFC 5869) ──────────────────────────────────────────────────*/
+void wfas_hkdf_sha256(const uint8_t *salt, size_t salt_len, const uint8_t *ikm, size_t ikm_len,
+                      const uint8_t *info, size_t info_len, uint8_t *out, size_t out_len) {
+    uint8_t prk[32], t[32], zero[32], buf[32 + 128 + 1];
+    size_t done = 0, tlen = 0;
+    uint8_t ctr = 1;
+    if (!salt || salt_len == 0) { memset(zero, 0, 32); salt = zero; salt_len = 32; }
+    if (info_len > 128) info_len = 128;
+    wfas_hmac_sha256(salt, salt_len, ikm, ikm_len, prk);
+    while (done < out_len) {
+        size_t n = 0, take;
+        if (tlen) { memcpy(buf, t, tlen); n = tlen; }
+        if (info && info_len) { memcpy(buf + n, info, info_len); n += info_len; }
+        buf[n++] = ctr;
+        wfas_hmac_sha256(prk, 32, buf, n, t);
+        tlen = 32;
+        take = out_len - done; if (take > 32) take = 32;
+        memcpy(out + done, t, take);
+        done += take; ctr++;
+    }
+}
+
+/* ── Session-key derivation ──────────────────────────────────────────────────*/
+void wfas_derive_unicast_keys(const char *key, const char *cn, const char *sn,
+        wfas_crypto_dir *c2s, wfas_crypto_dir *s2c) {
+    uint8_t salt[WFAS_NONCE_HEX * 2 + 2];
+    size_t sl = 0, i;
+    size_t kl = strlen(key);
+    for (i = 0; cn[i] && sl < sizeof salt; i++) salt[sl++] = (uint8_t)cn[i];
+    for (i = 0; sn[i] && sl < sizeof salt; i++) salt[sl++] = (uint8_t)sn[i];
+    wfas_hkdf_sha256(salt, sl, (const uint8_t *)key, kl, (const uint8_t *)"WFAS c2s key", 12, c2s->key, 32);
+    wfas_hkdf_sha256(salt, sl, (const uint8_t *)key, kl, (const uint8_t *)"WFAS c2s iv", 11, c2s->nonce_prefix, 4);
+    wfas_hkdf_sha256(salt, sl, (const uint8_t *)key, kl, (const uint8_t *)"WFAS s2c key", 12, s2c->key, 32);
+    wfas_hkdf_sha256(salt, sl, (const uint8_t *)key, kl, (const uint8_t *)"WFAS s2c iv", 11, s2c->nonce_prefix, 4);
+    c2s->send_counter = 0; s2c->send_counter = 0;
+}
+void wfas_derive_multicast_key(const char *key, const uint8_t *salt, size_t salt_len, wfas_crypto_dir *d) {
+    size_t kl = strlen(key);
+    wfas_hkdf_sha256(salt, salt_len, (const uint8_t *)key, kl, (const uint8_t *)"WFAS mcast key", 14, d->key, 32);
+    wfas_hkdf_sha256(salt, salt_len, (const uint8_t *)key, kl, (const uint8_t *)"WFAS mcast iv", 13, d->nonce_prefix, 4);
+    d->send_counter = 0;
+}
+
+/* ── Anti-replay window ──────────────────────────────────────────────────────*/
+void wfas_replay_init(wfas_replay_window *w) { memset(w, 0, sizeof *w); }
+int wfas_replay_check(const wfas_replay_window *w, uint64_t c) {
+    if (!w->initialized) return 1;
+    if (c > w->max_counter) return 1;
+    uint64_t off = w->max_counter - c;
+    if (off >= WFAS_REPLAY_BITS) return 0;
+    return ((w->seen[off / 64] >> (off % 64)) & 1ULL) ? 0 : 1;
+}
+static void replay_shift(uint64_t *seen, uint64_t shift) {
+    if (shift == 0) return;
+    if (shift >= WFAS_REPLAY_BITS) { memset(seen, 0, WFAS_REPLAY_WORDS * sizeof(uint64_t)); return; }
+    unsigned ws = (unsigned)(shift / 64), bs = (unsigned)(shift % 64);
+    int i;
+    for (i = WFAS_REPLAY_WORDS - 1; i >= 0; i--) {
+        uint64_t v = 0;
+        int src = i - (int)ws;
+        if (src >= 0) {
+            v = seen[src] << bs;
+            if (bs && src - 1 >= 0) v |= seen[src - 1] >> (64 - bs);
+        }
+        seen[i] = v;
+    }
+}
+void wfas_replay_commit(wfas_replay_window *w, uint64_t c) {
+    if (!w->initialized) { w->initialized = 1; w->max_counter = c; w->seen[0] = 1ULL; return; }
+    if (c > w->max_counter) {
+        replay_shift(w->seen, c - w->max_counter);
+        w->max_counter = c;
+        w->seen[0] |= 1ULL;
+    } else {
+        uint64_t off = w->max_counter - c;
+        if (off < WFAS_REPLAY_BITS) w->seen[off / 64] |= (1ULL << (off % 64));
+    }
+}
+
+/* ── Encrypted packet build/parse ────────────────────────────────────────────*/
+int wfas_encrypt_packet(wfas_crypto_dir *dir, uint8_t *out, size_t cap,
+        uint16_t seq, uint32_t pos, int silence, const uint8_t *pcm, size_t pcm_len) {
+    if (!dir || !out) return -1;
+    if (pcm_len > WFAS_MAX_ENC_PAYLOAD) return -1;
+    size_t total = WFAS_HEADER_SIZE + WFAS_COUNTER_BYTES + pcm_len + WFAS_AEAD_TAG_BYTES;
+    if (cap < total) return -1;
+    out[0] = WFAS_MAGIC_0; out[1] = WFAS_MAGIC_1; out[2] = WFAS_PROTOCOL_VERSION;
+    out[3] = (uint8_t)((silence ? WFAS_FLAG_SILENCE : 0) | WFAS_FLAG_ENCRYPTED);
+    wr_be16(out + 4, seq); wr_be32(out + 6, pos);
+    wr_be64(out + WFAS_HEADER_SIZE, dir->send_counter);
+    uint8_t nonce[12];
+    memcpy(nonce, dir->nonce_prefix, 4);
+    memcpy(nonce + 4, out + WFAS_HEADER_SIZE, 8);
+    uint8_t *ct = out + WFAS_HEADER_SIZE + WFAS_COUNTER_BYTES;
+    wfas_chacha20_poly1305_encrypt(dir->key, nonce, out, WFAS_HEADER_SIZE, pcm, pcm_len, ct, ct + pcm_len);
+    dir->send_counter += 1;
+    return (int)total;
+}
+int wfas_decrypt_packet(const wfas_crypto_dir *dir, wfas_replay_window *win,
+        const uint8_t *buf, size_t len, wfas_header *hdr, uint64_t *counter,
+        uint8_t *out_pcm, size_t out_cap) {
+    if (!dir || !buf) return -1;
+    if (len < WFAS_HEADER_SIZE + WFAS_COUNTER_BYTES + WFAS_AEAD_TAG_BYTES) return -1;
+    if (buf[0] != WFAS_MAGIC_0 || buf[1] != WFAS_MAGIC_1) return -1;
+    if (!(buf[3] & WFAS_FLAG_ENCRYPTED)) return -1;
+    if (hdr) { hdr->version = buf[2]; hdr->flags = buf[3]; hdr->seq = rd_be16(buf + 4); hdr->sample_pos = rd_be32(buf + 6); }
+    uint64_t ctr = rd_be64(buf + WFAS_HEADER_SIZE);
+    if (counter) *counter = ctr;
+    if (win && !wfas_replay_check(win, ctr)) return -2;
+    size_t ct_len = len - WFAS_HEADER_SIZE - WFAS_COUNTER_BYTES - WFAS_AEAD_TAG_BYTES;
+    if (ct_len > out_cap) return -1;
+    const uint8_t *ct = buf + WFAS_HEADER_SIZE + WFAS_COUNTER_BYTES;
+    uint8_t nonce[12];
+    memcpy(nonce, dir->nonce_prefix, 4);
+    memcpy(nonce + 4, buf + WFAS_HEADER_SIZE, 8);
+    if (wfas_chacha20_poly1305_decrypt(dir->key, nonce, buf, WFAS_HEADER_SIZE, ct, ct_len, ct + ct_len, out_pcm) != 0)
+        return -1;
+    if (win) wfas_replay_commit(win, ctr);
+    return (int)ct_len;
+}
+
+/* ── Multicast beacon ────────────────────────────────────────────────────────*/
+static size_t u64_to_dec(uint64_t v, char *out) {
+    char tmp[20]; size_t n = 0, i;
+    if (v == 0) { out[0] = '0'; out[1] = 0; return 1; }
+    while (v) { tmp[n++] = (char)('0' + (v % 10)); v /= 10; }
+    for (i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+    out[n] = 0; return n;
+}
+static uint64_t dec_to_u64(const char *s) {
+    uint64_t v = 0; while (*s >= '0' && *s <= '9') { v = v * 10 + (uint64_t)(*s - '0'); s++; } return v;
+}
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+static size_t sappend(char *dst, size_t pos, size_t cap, const char *s) {
+    while (*s && pos < cap - 1) dst[pos++] = *s++;
+    dst[pos] = 0; return pos;
+}
+/* Build "epoch=<e>;time=<t>;salt=<hex>" into fields (canonical, MAC-covered). */
+static size_t build_beacon_fields(uint64_t epoch, uint64_t ts, const char *salthex,
+                                  char *fields, size_t cap) {
+    char num[24];
+    size_t n = 0;
+    n = sappend(fields, n, cap, "epoch=");
+    u64_to_dec(epoch, num); n = sappend(fields, n, cap, num);
+    n = sappend(fields, n, cap, ";time=");
+    u64_to_dec(ts, num); n = sappend(fields, n, cap, num);
+    n = sappend(fields, n, cap, ";salt=");
+    n = sappend(fields, n, cap, salthex);
+    return n;
+}
+int wfas_build_mcast_beacon(const char *key, uint64_t epoch, uint64_t ts,
+        const uint8_t *salt, size_t salt_len, char *out, size_t cap) {
+    if (!key || !salt || !out || salt_len > WFAS_SALT_BYTES) return -1;
+    char salthex[WFAS_SALT_BYTES * 2 + 1];
+    char fields[96], macin[128], machex[65];
+    uint8_t mac[32];
+    size_t n;
+    to_hex(salt, salt_len, salthex);
+    build_beacon_fields(epoch, ts, salthex, fields, sizeof fields);
+    n = sappend(macin, 0, sizeof macin, "WFAS-MCAST:");
+    sappend(macin, n, sizeof macin, fields);
+    wfas_hmac_sha256((const uint8_t *)key, strlen(key), (const uint8_t *)macin, strlen(macin), mac);
+    to_hex(mac, 32, machex);
+    n = sappend(out, 0, cap, WFAS_MSG_MCAST_ENC);
+    n = sappend(out, n, cap, ";");
+    n = sappend(out, n, cap, fields);
+    n = sappend(out, n, cap, ";mac=");
+    n = sappend(out, n, cap, machex);
+    return (int)n;
+}
+int wfas_parse_mcast_beacon(const char *key, const char *msg, uint64_t last_epoch,
+        uint64_t *epoch_out, uint64_t *ts_out, uint8_t *salt, size_t salt_cap, size_t *salt_len) {
+    if (!key || !msg) return -1;
+    if (!starts((const uint8_t *)msg, strlen(msg), WFAS_MSG_MCAST_ENC)) return -1;
+    char ev[24], tv[24], sh[WFAS_SALT_BYTES * 2 + 1], mv[65];
+    char fields[96], macin[128], machex[65];
+    uint8_t mac[32];
+    size_t n, i, shl;
+    if (!wfas_get_token(msg, "epoch", ev, sizeof ev)) return -1;
+    if (!wfas_get_token(msg, "time", tv, sizeof tv)) return -1;
+    if (!wfas_get_token(msg, "salt", sh, sizeof sh)) return -1;
+    if (!wfas_get_token(msg, "mac", mv, sizeof mv)) return -1;
+    build_beacon_fields(dec_to_u64(ev), dec_to_u64(tv), sh, fields, sizeof fields);
+    n = sappend(macin, 0, sizeof macin, "WFAS-MCAST:");
+    sappend(macin, n, sizeof macin, fields);
+    wfas_hmac_sha256((const uint8_t *)key, strlen(key), (const uint8_t *)macin, strlen(macin), mac);
+    to_hex(mac, 32, machex);
+    if (!wfas_proof_equal(machex, mv)) return -1;
+    uint64_t e = dec_to_u64(ev);
+    if (e <= last_epoch) return -2;
+    shl = strlen(sh);
+    if (shl % 2 || shl / 2 > salt_cap) return -1;
+    for (i = 0; i < shl / 2; i++) {
+        int hi = hexval(sh[i * 2]), lo = hexval(sh[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        salt[i] = (uint8_t)((hi << 4) | lo);
+    }
+    if (salt_len) *salt_len = shl / 2;
+    if (epoch_out) *epoch_out = e;
+    if (ts_out) *ts_out = dec_to_u64(tv);
+    return 0;
+}

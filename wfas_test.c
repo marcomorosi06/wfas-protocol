@@ -35,7 +35,43 @@ static int selftest(void){
     wfas_auth_proof("secret",'S',"aaaa","bbbb",sp);
     wfas_auth_proof("secret",'C',"aaaa","bbbb",cp);
     printf("domain separation (S != C): %s\n", wfas_proof_equal(sp,cp)?"FAIL":"OK");
-    return strcmp(hex,exp)==0 && !wfas_proof_equal(sp,cp) ? 0 : 1;
+
+    int ce;
+    {
+        uint8_t k[32]; for(i=0;i<32;i++) k[i]=(uint8_t)(0x80+i);
+        uint8_t nc[12]={0x07,0,0,0,0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x47};
+        uint8_t ad[12]={0x50,0x51,0x52,0x53,0xc0,0xc1,0xc2,0xc3,0xc4,0xc5,0xc6,0xc7};
+        const char *pt="Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        size_t pl=strlen(pt); uint8_t ctb[200],tg[16],db[200];
+        uint8_t etag[16]={0x1a,0xe1,0x0b,0x59,0x4f,0x09,0xe2,0x6a,0x7e,0x90,0x2e,0xcb,0xd0,0x60,0x06,0x91};
+        wfas_chacha20_poly1305_encrypt(k,nc,ad,12,(const uint8_t*)pt,pl,ctb,tg);
+        int aead = memcmp(tg,etag,16)==0 && wfas_chacha20_poly1305_decrypt(k,nc,ad,12,ctb,pl,tg,db)==0 && memcmp(db,pt,pl)==0;
+        printf("ChaCha20-Poly1305 AEAD RFC8439: %s\n", aead?"OK":"FAIL");
+        uint8_t ikm[22]; memset(ikm,0x0b,22); uint8_t st[13]; for(i=0;i<13;i++) st[i]=(uint8_t)i;
+        uint8_t inf[10]; for(i=0;i<10;i++) inf[i]=(uint8_t)(0xf0+i); uint8_t okm[42];
+        uint8_t eok[42]={0x3c,0xb2,0x5f,0x25,0xfa,0xac,0xd5,0x7a,0x90,0x43,0x4f,0x64,0xd0,0x36,0x2f,0x2a,
+                         0x2d,0x2d,0x0a,0x90,0xcf,0x1a,0x5a,0x4c,0x5d,0xb0,0x2d,0x56,0xec,0xc4,0xc5,0xbf,
+                         0x34,0x00,0x72,0x08,0xd5,0xb8,0x87,0x18,0x58,0x65};
+        wfas_hkdf_sha256(st,13,ikm,22,inf,10,okm,42);
+        int hk = memcmp(okm,eok,42)==0; printf("HKDF-SHA256 RFC5869: %s\n", hk?"OK":"FAIL");
+        wfas_crypto_dir cs,ss,cr,sr;
+        wfas_derive_unicast_keys("pw","aabb","ccdd",&cs,&ss); wfas_derive_unicast_keys("pw","aabb","ccdd",&cr,&sr);
+        int16_t pcm[240]; for(i=0;i<240;i++) pcm[i]=(int16_t)(i*131-9000);
+        uint8_t pk[1500],op[1500]; wfas_header hh; uint64_t cnt; wfas_replay_window w; wfas_replay_init(&w);
+        int en=wfas_encrypt_packet(&cs,pk,sizeof pk,7,99,0,(const uint8_t*)pcm,sizeof pcm);
+        int rt = en>0 && wfas_decrypt_packet(&cr,&w,pk,en,&hh,&cnt,op,sizeof op)==(int)sizeof pcm && memcmp(op,pcm,sizeof pcm)==0 && hh.seq==7;
+        printf("encrypted packet roundtrip: %s\n", rt?"OK":"FAIL");
+        int rep = wfas_decrypt_packet(&cr,&w,pk,en,&hh,&cnt,op,sizeof op)==-2;
+        printf("anti-replay drops duplicate: %s\n", rep?"OK":"FAIL");
+        uint8_t slt[16]; for(i=0;i<16;i++) slt[i]=(uint8_t)(i+1);
+        char bc[256]; uint64_t ep,tsv; uint8_t gs[16]; size_t gl;
+        wfas_build_mcast_beacon("gk",5,1700000000ULL,slt,16,bc,sizeof bc);
+        int be = wfas_parse_mcast_beacon("gk",bc,4,&ep,&tsv,gs,16,&gl)==0 && ep==5 && gl==16 && memcmp(gs,slt,16)==0
+                 && wfas_parse_mcast_beacon("gk",bc,5,&ep,&tsv,gs,16,&gl)==-2;
+        printf("multicast beacon + ghost-replay guard: %s\n", be?"OK":"FAIL");
+        ce = aead && hk && rt && rep && be;
+    }
+    return (strcmp(hex,exp)==0 && !wfas_proof_equal(sp,cp) && ce) ? 0 : 1;
 }
 
 static int run_server(void){
