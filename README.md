@@ -172,13 +172,14 @@ BYE / CLIENT_BYE                              clean disconnect
 Discovery beacon (UDP multicast `239.255.0.1:9091`, every ~3 s):
 
 ```
-WIFI_AUDIO_STREAMER_DISCOVERY;<host>;<MULTICAST|UNICAST>;<port>;protocols=...;sr=..;ch=..;bd=..[;auth=OFF|ASK|KEY][;enc=0|1]
+WIFI_AUDIO_STREAMER_DISCOVERY;<host>;<MULTICAST|UNICAST>;<port>;protocols=...;sr=..;ch=..;bd=..[;auth=OFF|ASK|KEY][;enc=0|1][;mic=tx|rx|txrx]
 ```
 
-The optional `auth=` and `enc=` tokens are advisory display hints (let a client
-badge a server as encrypted / key-protected); they are unauthenticated and must
-not drive any security decision. Unknown tokens are ignored, so they are
-backward-compatible.
+The optional `auth=`, `enc=` and `mic=` tokens are advisory display hints (let a
+client badge a server as encrypted / key-protected, and show whether it streams
+its microphone (`tx`) or accepts the client's mic / talk-back (`rx`)); they are
+unauthenticated and must not drive any security decision. Unknown tokens are
+ignored, so they are backward-compatible.
 
 The full normative specification lives in the app repositories
 (`WFAS_PROTOCOL.md`). This implementation is the executable companion to it.
